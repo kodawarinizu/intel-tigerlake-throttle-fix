@@ -457,12 +457,17 @@ for cpu in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; d
     echo performance > "$cpu" 2>/dev/null || true
 done
 
-# RAPL: PL1=45W / PL2=60W / PL2 window=10s
-# CPU self-regulates by temperature — the fan defines the real limit
+# RAPL MSR path: PL1=45W / PL2=60W / PL2 window=10s
 RAPL=/sys/devices/virtual/powercap/intel-rapl/intel-rapl:0
-[ -w "$RAPL/constraint_0_power_limit_uw" ] && echo 45000000 > "$RAPL/constraint_0_power_limit_uw"
-[ -w "$RAPL/constraint_1_power_limit_uw" ] && echo 60000000 > "$RAPL/constraint_1_power_limit_uw"
-[ -w "$RAPL/constraint_1_time_window_us" ] && echo 10000000 > "$RAPL/constraint_1_time_window_us"
+[ -w "$RAPL/constraint_0_power_limit_uw" ] && echo 45000000 > "$RAPL/constraint_0_power_limit_uw" || true
+[ -w "$RAPL/constraint_1_power_limit_uw" ] && echo 60000000 > "$RAPL/constraint_1_power_limit_uw" || true
+[ -w "$RAPL/constraint_1_time_window_us" ] && echo 10000000 > "$RAPL/constraint_1_time_window_us" || true
+
+# RAPL MMIO path (processor_thermal_rapl): same limits — hardware takes the minimum of both
+# Without this, firmware caps the CPU at ~15W regardless of MSR settings
+RAPL_MMIO=/sys/devices/virtual/powercap/intel-rapl-mmio/intel-rapl-mmio:0
+[ -w "$RAPL_MMIO/constraint_0_power_limit_uw" ] && echo 45000000 > "$RAPL_MMIO/constraint_0_power_limit_uw" || true
+[ -w "$RAPL_MMIO/constraint_1_power_limit_uw" ] && echo 60000000 > "$RAPL_MMIO/constraint_1_power_limit_uw" || true
 SCRIPT_EOF
 
     chmod +x /usr/local/bin/intel-dptf-policy.sh
@@ -470,8 +475,7 @@ SCRIPT_EOF
     cat > /etc/systemd/system/intel-dptf-policy.service << 'SVC_EOF'
 [Unit]
 Description=Intel DPTF enable_policy and performance EPP
-After=systemd-modules-load.service
-DefaultDependencies=no
+After=sysinit.target systemd-modules-load.service
 
 [Service]
 Type=oneshot
