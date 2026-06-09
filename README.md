@@ -127,13 +127,20 @@ Plus registration and cleanup of the attribute in `probe()` and `remove()`.
 > recognized in this firmware revision). The attribute is ready for when a firmware
 > update adds support. The performance gains come from layers 2 and 3.
 
-### Layer 2 — Unlocked RAPL
+### Layer 2 — Unlocked RAPL (both MSR and MMIO paths)
 
 | Parameter | Value | Reason |
 |---|---|---|
-| PL1 (long-term) | 45 W | Above the real thermal ceiling (~35 W); the CPU self-regulates by temperature, not by RAPL |
+| PL1 (long-term) | 45 W | Above the real thermal ceiling; CPU self-regulates by temperature |
 | PL2 (short-term) | 60 W | Initial burst up to 4.3 GHz |
 | PL2 time window | 10 s | Extends the burst window from 2 ms to 10 s |
+
+> **Critical discovery (post-reboot):** On TigerLake systems, the Linux kernel exposes
+> **two RAPL interfaces simultaneously**: the classic MSR path (`intel-rapl`, via
+> `intel_rapl_msr`) and an MMIO path (`intel-rapl-mmio`, via `processor_thermal_rapl`).
+> The CPU enforces the **lower** of the two. At boot, the firmware initialises the MMIO
+> RAPL to PL1=15 W / PL2=18.75 W (from the PPCC ACPI table), capping the CPU at ~19 W
+> even when the MSR path shows 45 W. Both paths must be unlocked.
 
 ### Layer 3 — EPP performance
 
@@ -145,7 +152,7 @@ highest available P-states.
 ## Quick Install (any distro)
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/intel-tigerlake-throttle-fix/main/install-throttle-fix.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/kodawarinizu/intel-tigerlake-throttle-fix/main/install-throttle-fix.sh)
 ```
 
 ---
@@ -186,16 +193,26 @@ ls /sys/devices/platform/INTC1040:00/enable_policy
 ```bash
 #!/bin/bash
 DPTF_DEV=$(find /sys/devices/platform -name "enable_policy" 2>/dev/null | head -1)
-[ -n "$DPTF_DEV" ] && { echo 1 > "$DPTF_DEV" 2>/dev/null; echo 3 > "$DPTF_DEV" 2>/dev/null; } || true
+if [ -n "$DPTF_DEV" ]; then
+    echo 1 > "$DPTF_DEV" 2>/dev/null || true
+    echo 3 > "$DPTF_DEV" 2>/dev/null || true
+fi
 
 for cpu in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
     echo performance > "$cpu" 2>/dev/null || true
 done
 
+# MSR RAPL path
 RAPL=/sys/devices/virtual/powercap/intel-rapl/intel-rapl:0
-[ -w "$RAPL/constraint_0_power_limit_uw" ] && echo 45000000 > "$RAPL/constraint_0_power_limit_uw"
-[ -w "$RAPL/constraint_1_power_limit_uw" ] && echo 60000000 > "$RAPL/constraint_1_power_limit_uw"
-[ -w "$RAPL/constraint_1_time_window_us" ] && echo 10000000 > "$RAPL/constraint_1_time_window_us"
+[ -w "$RAPL/constraint_0_power_limit_uw" ] && echo 45000000 > "$RAPL/constraint_0_power_limit_uw" || true
+[ -w "$RAPL/constraint_1_power_limit_uw" ] && echo 60000000 > "$RAPL/constraint_1_power_limit_uw" || true
+[ -w "$RAPL/constraint_1_time_window_us" ] && echo 10000000 > "$RAPL/constraint_1_time_window_us" || true
+
+# MMIO RAPL path (processor_thermal_rapl) — firmware sets this to 15W at boot
+# CPU enforces the lower of MSR and MMIO; without this the CPU stays at ~15W
+RAPL_MMIO=/sys/devices/virtual/powercap/intel-rapl-mmio/intel-rapl-mmio:0
+[ -w "$RAPL_MMIO/constraint_0_power_limit_uw" ] && echo 45000000 > "$RAPL_MMIO/constraint_0_power_limit_uw" || true
+[ -w "$RAPL_MMIO/constraint_1_power_limit_uw" ] && echo 60000000 > "$RAPL_MMIO/constraint_1_power_limit_uw" || true
 ```
 
 ### Service `/etc/systemd/system/intel-dptf-policy.service`
@@ -203,8 +220,7 @@ RAPL=/sys/devices/virtual/powercap/intel-rapl/intel-rapl:0
 ```ini
 [Unit]
 Description=Intel DPTF enable_policy and performance EPP
-After=systemd-modules-load.service
-DefaultDependencies=no
+After=sysinit.target systemd-modules-load.service
 
 [Service]
 Type=oneshot
