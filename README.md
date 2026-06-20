@@ -22,9 +22,10 @@ fan is not at its limit.
 
 The Intel DPTF (Dynamic Platform and Thermal Framework) firmware implements a
 "thermal fallback" mechanism: if it does not detect that the OS is managing thermals
-through DPTF/OSC policies, it aggressively reduces PL1 to ~10 W to protect the
-hardware. The Linux `int3400_thermal` driver (INTC1040 device on TigerLake) provided
-no mechanism to signal the firmware that the OS has active thermal control.
+through DPTF/OSC policies, it aggressively reduces the power limit to ~10–15 W to
+protect the hardware. The Linux `int3400_thermal` driver (INTC1040 device on
+TigerLake) provided no mechanism to signal the firmware that the OS has active
+thermal control.
 
 ---
 
@@ -33,7 +34,7 @@ no mechanism to signal the firmware that the OS has active thermal control.
 | Field | Value |
 |---|---|
 | CPU | Intel Core i7-1185G7 @ 3.00 GHz (boost up to 4.8 GHz) |
-| Kernel | `7.0.11-1-cachyos` (CachyOS / Linux 7.0.11) |
+| Kernel | `7.0.x-1-cachyos` (CachyOS / Linux 7.0.x) |
 | ACPI device | `INTC1040:00` (TigerLake version of INT3400) |
 | Driver | `int3400_thermal` (`CONFIG_INT340X_THERMAL=m`) |
 | Tjmax hardware | 100 °C (firmware TCC offset: 2 °C → throttle at 98 °C) |
@@ -49,7 +50,7 @@ no mechanism to signal the firmware that the OS has active thermal control.
 |---|---|---|---|
 | Linux **without fix** | ~1.8 GHz | ~1.8 GHz | Stable but slow |
 | Windows + Intel DTT | ~4.2 GHz | 2.5–3.5 GHz (oscillates) | **Unstable** |
-| **Linux with fix** | **~4.3 GHz** | **3.8–3.9 GHz** | **Fully stable** |
+| **Linux with fix** | **~4.3 GHz** | **3.8–4.2 GHz** | **Fully stable** |
 
 Linux with the fix **outperforms Windows in sustained throughput**: Windows with DTT
 constantly renegotiates power limits causing continuous frequency swings. This fix
@@ -61,10 +62,9 @@ frequencies.
 ```
 Seconds   │ MHz range      │ Watts │ Temp     │ Phase
 ──────────┼────────────────┼───────┼──────────┼──────────────────────
-   1–3 s  │ 4047 – 4300    │ 44–48W│ 85–93 °C │ PL2 maximum burst
-   4–10 s │ 4065 – 4300    │ 43–47W│ 94–98 °C │ PL2 sustained
-  11–20 s │ 3900 – 4200    │ 37–42W│ 95–99 °C │ Thermal transition
-  20–60 s │ 3800 – 3900    │ 35–37W│ 95–99 °C │ Sustained equilibrium
+   1–5 s  │ 4047 – 4300    │ 44–48W│ 85–95 °C │ PL2 burst
+   6–20 s │ 3900 – 4300    │ 41–47W│ 93–96 °C │ PL2 sustained
+  20–60 s │ 3800 – 4200    │ 40–45W│ 94–98 °C │ Sustained equilibrium
   post-60s│ 4300 – 4470    │  ~5 W │ 64–68 °C │ Single-core free boost
 ```
 
@@ -89,17 +89,16 @@ All-core   (8 threads):    5467 events/s   (multi-core efficiency: 4.03×)
 
 Adds the `enable_policy` sysfs attribute, which lets userspace signal the firmware
 that the OS has active DPTF control — without recompiling the full kernel (only the
-single module).
+single module is compiled, ~30 seconds).
 
 **Why the original patch doesn't apply directly** — The patch (March 2022, kernel
 ~5.18) proposed changing the signature of `int3400_thermal_run_osc()`. In kernel
-7.0.11 that refactoring is already merged upstream. The only genuinely new change is
+7.0.x that refactoring is already merged upstream. The only genuinely new change is
 the `enable_policy` attribute. The patch was rebased by extracting only that part:
 
 ```diff
 --- a/drivers/thermal/intel/int340x_thermal/int3400_thermal.c
 +++ b/drivers/thermal/intel/int340x_thermal/int3400_thermal.c
-@@ -192,6 +192,30 @@ static int set_os_uuid_mask(...)
 +static ssize_t enable_policy_store(struct device *dev,
 +                                   struct device_attribute *attr,
 +                                   const char *buf, size_t count)
@@ -121,11 +120,11 @@ the `enable_policy` attribute. The patch was rebased by extracting only that par
 +static DEVICE_ATTR_WO(enable_policy);
 ```
 
-Plus registration and cleanup of the attribute in `probe()` and `remove()`.
+Plus `device_create_file`/`device_remove_file` in `probe()`/`remove()`.
 
 > **Note on INTC1040:** On this firmware the `_OSC` call returns `-EPERM` (UUID not
-> recognized in this firmware revision). The attribute is ready for when a firmware
-> update adds support. The performance gains come from layers 2 and 3.
+> recognized). The attribute is ready for when a firmware update adds support.
+> The performance gains come from layers 2 and 3.
 
 ### Layer 2 — Unlocked RAPL (both MSR and MMIO paths)
 
@@ -135,12 +134,18 @@ Plus registration and cleanup of the attribute in `probe()` and `remove()`.
 | PL2 (short-term) | 60 W | Initial burst up to 4.3 GHz |
 | PL2 time window | 10 s | Extends the burst window from 2 ms to 10 s |
 
-> **Critical discovery (post-reboot):** On TigerLake systems, the Linux kernel exposes
-> **two RAPL interfaces simultaneously**: the classic MSR path (`intel-rapl`, via
-> `intel_rapl_msr`) and an MMIO path (`intel-rapl-mmio`, via `processor_thermal_rapl`).
-> The CPU enforces the **lower** of the two. At boot, the firmware initialises the MMIO
-> RAPL to PL1=15 W / PL2=18.75 W (from the PPCC ACPI table), capping the CPU at ~19 W
-> even when the MSR path shows 45 W. Both paths must be unlocked.
+> **Critical discovery:** On TigerLake, Linux exposes **two simultaneous RAPL
+> interfaces**:
+>
+> | Interface | Path | Module |
+> |---|---|---|
+> | MSR | `/sys/devices/virtual/powercap/intel-rapl/` | `intel_rapl_msr` |
+> | MMIO | `/sys/devices/virtual/powercap/intel-rapl-mmio/` | `processor_thermal_rapl` |
+>
+> The CPU enforces the **lower** of the two. At boot the firmware initialises the
+> MMIO path to **PL1 = 15 W / PL2 = 18.75 W** (from the ACPI PPCC table), capping
+> the CPU at ~19 W even when the MSR path shows 45 W.
+> **Both paths must be written.**
 
 ### Layer 3 — EPP performance
 
@@ -149,42 +154,66 @@ highest available P-states.
 
 ---
 
+## Post-Update Behaviour (kernel updates)
+
+When pacman updates `linux-cachyos`, it overwrites the patched `.ko.zst` with the
+stock module. Without the patched module:
+
+- The first ~5 s under load run normally at 45 W / 4.3 GHz (PL2 burst, RAPL still set)
+- After ~5–10 s the firmware's DPTF thermal-fallback kicks in dynamically, reducing
+  actual CPU power to ~15–20 W (~2.6–3.0 GHz), even though the RAPL sysfs still
+  reads 45 W
+
+**Solution:** a pacman hook (`/etc/pacman.d/hooks/int3400-patch.hook`) automatically
+recompiles and reinstalls the patched module after every kernel upgrade.
+
+---
+
 ## Quick Install (any distro)
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/kodawarinizu/intel-tigerlake-throttle-fix/main/install-throttle-fix.sh)
+sudo bash install-throttle-fix.sh
 ```
+
+On Arch/CachyOS, the installer also sets up the pacman hook for automatic
+rebuilds on kernel updates.
 
 ---
 
 ## Manual Installation (CachyOS / Arch)
 
 ```bash
-# 1. Copy patched source from the already-prepared PKGBUILD
-SRCDIR=~/linux-cachyos/linux-cachyos/src/cachyos-7.0.11-1/drivers/thermal/intel/int340x_thermal
+# 1. Download source for the running kernel
+KVER=$(uname -r)
+KVER_MAIN=$(echo "$KVER" | grep -oP '^\d+\.\d+')
+BASE="https://raw.githubusercontent.com/torvalds/linux/v${KVER_MAIN}"
+SUBPATH="drivers/thermal/intel/int340x_thermal"
 
-# 2. Build only the module
 mkdir -p /tmp/int3400_build
-cp $SRCDIR/int3400_thermal.c $SRCDIR/acpi_thermal_rel.h /tmp/int3400_build/
-echo "obj-m := int3400_thermal.o" > /tmp/int3400_build/Makefile
+curl -fsSL "$BASE/$SUBPATH/int3400_thermal.c" -o /tmp/int3400_build/int3400_thermal.c
+curl -fsSL "$BASE/$SUBPATH/acpi_thermal_rel.h" -o /tmp/int3400_build/acpi_thermal_rel.h
 
-make -C /usr/lib/modules/$(uname -r)/build \
+# 2. Apply the patch
+python3 int3400_patch.py /tmp/int3400_build/int3400_thermal.c
+
+# 3. Build only the module
+echo "obj-m := int3400_thermal.o" > /tmp/int3400_build/Makefile
+make -C /usr/lib/modules/$KVER/build \
      M=/tmp/int3400_build \
      CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
      modules
 
-# 3. Verify vermagic matches the running kernel
+# 4. Verify vermagic matches the running kernel
 modinfo /tmp/int3400_build/int3400_thermal.ko | grep vermagic
 
-# 4. Install
-KVER=$(uname -r)
-MODULE_PATH="/usr/lib/modules/$KVER/kernel/drivers/thermal/intel/int340x_thermal/int3400_thermal.ko.zst"
+# 5. Install
+MODULE_PATH="/usr/lib/modules/$KVER/kernel/$SUBPATH/int3400_thermal.ko.zst"
 cp "$MODULE_PATH" /tmp/int3400_thermal.ko.zst.backup
 zstd -19 /tmp/int3400_build/int3400_thermal.ko -o "$MODULE_PATH"
 depmod -a "$KVER"
 rmmod int3400_thermal && modprobe int3400_thermal
 
-# 5. Verify the attribute is present
+# 6. Verify the attribute is present
 ls /sys/devices/platform/INTC1040:00/enable_policy
 ```
 
@@ -192,6 +221,9 @@ ls /sys/devices/platform/INTC1040:00/enable_policy
 
 ```bash
 #!/bin/bash
+# Intel INT3400/INTC1040 CPU throttle fix
+# Ref: https://github.com/intel/thermal_daemon/issues/341
+
 DPTF_DEV=$(find /sys/devices/platform -name "enable_policy" 2>/dev/null | head -1)
 if [ -n "$DPTF_DEV" ]; then
     echo 1 > "$DPTF_DEV" 2>/dev/null || true
@@ -202,14 +234,13 @@ for cpu in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; d
     echo performance > "$cpu" 2>/dev/null || true
 done
 
-# MSR RAPL path
+# RAPL MSR path
 RAPL=/sys/devices/virtual/powercap/intel-rapl/intel-rapl:0
 [ -w "$RAPL/constraint_0_power_limit_uw" ] && echo 45000000 > "$RAPL/constraint_0_power_limit_uw" || true
 [ -w "$RAPL/constraint_1_power_limit_uw" ] && echo 60000000 > "$RAPL/constraint_1_power_limit_uw" || true
 [ -w "$RAPL/constraint_1_time_window_us" ] && echo 10000000 > "$RAPL/constraint_1_time_window_us" || true
 
-# MMIO RAPL path (processor_thermal_rapl) — firmware sets this to 15W at boot
-# CPU enforces the lower of MSR and MMIO; without this the CPU stays at ~15W
+# RAPL MMIO path — firmware sets this to 15W at boot; CPU takes the lower of both
 RAPL_MMIO=/sys/devices/virtual/powercap/intel-rapl-mmio/intel-rapl-mmio:0
 [ -w "$RAPL_MMIO/constraint_0_power_limit_uw" ] && echo 45000000 > "$RAPL_MMIO/constraint_0_power_limit_uw" || true
 [ -w "$RAPL_MMIO/constraint_1_power_limit_uw" ] && echo 60000000 > "$RAPL_MMIO/constraint_1_power_limit_uw" || true
@@ -231,35 +262,76 @@ ExecStart=/usr/local/bin/intel-dptf-policy.sh
 WantedBy=multi-user.target
 ```
 
+### Pacman hook `/etc/pacman.d/hooks/int3400-patch.hook`
+
+Installed automatically by `install-throttle-fix.sh` on Arch/CachyOS.
+Triggers `/usr/local/bin/int3400-rebuild.sh` after every kernel package upgrade.
+
+```ini
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux-cachyos
+Target = linux-cachyos-headers
+
+[Action]
+Description = Recompiling patched int3400_thermal module for DPTF fix...
+When = PostTransaction
+Exec = /usr/local/bin/int3400-rebuild.sh
+AbortOnFail
+```
+
+The rebuild script (`/usr/local/bin/int3400-rebuild.sh`):
+1. Downloads `int3400_thermal.c` for the new kernel version from kernel.org
+2. Applies the `enable_policy` patch via `/usr/local/lib/int3400_patch.py`
+3. Compiles with clang/LLVM to match the CachyOS kernel toolchain
+4. Installs the `.ko.zst` with the correct vermagic
+5. Hot-reloads the module and restarts the service
+
 ```bash
 systemctl enable --now intel-dptf-policy.service
 ```
 
 ---
 
+## Installed Files
+
+| File | Purpose |
+|---|---|
+| `/usr/lib/modules/<kver>/.../int3400_thermal.ko.zst` | Patched module |
+| `/usr/local/bin/intel-dptf-policy.sh` | Boot configuration script |
+| `/etc/systemd/system/intel-dptf-policy.service` | systemd service (enabled) |
+| `/etc/pacman.d/hooks/int3400-patch.hook` | Pacman hook — auto-rebuild on kernel update |
+| `/usr/local/bin/int3400-rebuild.sh` | Rebuild script called by the hook |
+| `/usr/local/lib/int3400_patch.py` | Python patcher for int3400_thermal.c |
+
+---
+
 ## Verification
 
 ```bash
-# Module loaded
+# Module loaded with patch
 lsmod | grep int3400
-
-# Attribute present
 ls /sys/devices/platform/INTC1040:00/enable_policy
 
 # EPP on all cores
 cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference   # performance
 
-# RAPL limits
+# RAPL MSR limits
 cat /sys/devices/virtual/powercap/intel-rapl/intel-rapl:0/constraint_0_power_limit_uw  # 45000000
 cat /sys/devices/virtual/powercap/intel-rapl/intel-rapl:0/constraint_1_power_limit_uw  # 60000000
 
-# Platform profile
-cat /sys/firmware/acpi/platform_profile                                   # performance
+# RAPL MMIO limits (must also be 45W — firmware sets this to 15W at boot)
+cat /sys/devices/virtual/powercap/intel-rapl-mmio/intel-rapl-mmio:0/constraint_0_power_limit_uw  # 45000000
 
 # Service status
 systemctl status intel-dptf-policy.service
 
-# TCC offset (actual throttle point)
+# Pacman hook active
+ls /etc/pacman.d/hooks/int3400-patch.hook
+
+# TCC offset
 rdmsr -p 0 0x1A2 | python3 -c "
 import sys; v=int(sys.stdin.read().strip(),16)
 tj=(v>>16)&0xFF; off=(v>>24)&0x3F
@@ -272,11 +344,17 @@ print(f'Tjmax={tj}°C  offset={off}°C  throttle_at={tj-off}°C')"
 # Terminal 1 — stress
 stress-ng --cpu 0 --timeout 60s
 
-# Terminal 2 — real-time frequency and temperature
-watch -n1 "grep 'cpu MHz' /proc/cpuinfo | awk '{print \$4}' | sort -rn | head -1 | \
-xargs -I{} sh -c 'echo -n \"max: {} MHz  \"; \
-cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | \
-awk \"BEGIN{m=0} {v=\\\$1/1000; if(v>m)m=v} END{printf \\\"temp: %.0f°C\\n\\\",m}\"'"
+# Terminal 2 — real-time frequency, power and temperature
+watch -n1 "
+echo -n 'freq: '; grep 'cpu MHz' /proc/cpuinfo | awk '{if(\$4>m)m=\$4}END{printf \"%d MHz\n\",m}'
+echo -n 'pwr:  '; python3 -c \"
+import time
+e1=int(open('/sys/devices/virtual/powercap/intel-rapl/intel-rapl:0/energy_uj').read())
+time.sleep(1)
+e2=int(open('/sys/devices/virtual/powercap/intel-rapl/intel-rapl:0/energy_uj').read())
+print(f'{(e2-e1)/1e6:.1f}W')\"
+echo -n 'temp: '; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | awk 'BEGIN{m=0}{v=\$1/1000;if(v>m)m=v}END{printf \"%.0f°C\n\",m}'
+"
 ```
 
 ---
@@ -284,16 +362,24 @@ awk \"BEGIN{m=0} {v=\\\$1/1000; if(v>m)m=v} END{printf \\\"temp: %.0f°C\\n\\\",
 ## Troubleshooting
 
 ```bash
+# Frequency drops after ~5s under load → patched module not loaded
+ls /sys/devices/platform/INTC1040:00/enable_policy 2>/dev/null || echo "module not patched"
+# Fix: run int3400-rebuild.sh
+sudo /usr/local/bin/int3400-rebuild.sh
+
+# RAPL MMIO is 15W instead of 45W → service didn't apply MMIO limits
+cat /sys/devices/virtual/powercap/intel-rapl-mmio/intel-rapl-mmio:0/constraint_0_power_limit_uw
+# Fix: restart service
+systemctl restart intel-dptf-policy.service
+
 # What is throttling the CPU?
 dmesg | grep -iE "thermal|rapl|throttl|power limit" | tail -20
 
-# Is PROCHOT active?  (1 = throttling due to temperature)
+# Is PROCHOT active? (1 = temperature throttle)
 rdmsr -p 0 --decimal 0x19C | awk '{print "PROCHOT:", (($1>>4)&1)}'
 
-# Did the firmware lower the RAPL limit?
-cat /sys/devices/virtual/powercap/intel-rapl/intel-rapl:0/constraint_0_power_limit_uw
-# If < 45000000, either the service isn't running or the firmware overrode it
-systemctl restart intel-dptf-policy.service
+# Is the pacman hook installed?
+cat /etc/pacman.d/hooks/int3400-patch.hook
 ```
 
 ---
@@ -307,16 +393,7 @@ cp /tmp/int3400_thermal.ko.zst.backup "$MODULE_PATH"
 depmod -a "$KVER"
 rmmod int3400_thermal && modprobe int3400_thermal
 systemctl disable --now intel-dptf-policy.service
+rm -f /etc/pacman.d/hooks/int3400-patch.hook
+rm -f /usr/local/bin/int3400-rebuild.sh /usr/local/lib/int3400_patch.py
+rm -f /usr/local/bin/intel-dptf-policy.sh
 ```
-
----
-
-## Modified Files
-
-| File | Description |
-|---|---|
-| `/usr/lib/modules/7.0.11-1-cachyos/.../int3400_thermal.ko.zst` | Patched module |
-| `/tmp/int3400_thermal.ko.zst.backup` | Original module backup |
-| `/usr/local/bin/intel-dptf-policy.sh` | Boot configuration script |
-| `/etc/systemd/system/intel-dptf-policy.service` | systemd service (enabled) |
-| `~/linux-cachyos/linux-cachyos/0001-thermal-int340x-Add-new-attribute-for-policy-info.patch` | Rebased patch for kernel 7.0.11 |
